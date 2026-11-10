@@ -1,174 +1,63 @@
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
 
-# Initialize FastAPI application
+from backend.app.core.config import settings
+from backend.app.core.database import Base, engine
+
+# Register SQLAlchemy models
+from backend.app import models
+
+# Import API routers
+from backend.app.routers import documents, knowledge
+
+
+# ==========================================
+# Initialize Database Tables
+# ==========================================
+
+Base.metadata.create_all(bind=engine)
+
+
+# ==========================================
+# Initialize FastAPI Application
+# ==========================================
+
 app = FastAPI(
-    title="Enterprise Knowledge Assistant",
-    description="REST API for managing enterprise documents",
+    title=settings.app_name,
+    description=(
+        "Upload enterprise documents, search their content, "
+        "and ask document-grounded questions."
+    ),
     version="1.0.0"
 )
 
 
+# ==========================================
 # Home API
-@app.get("/")
+# ==========================================
+
+@app.get("/", tags=["Health"])
 def home():
     return {
         "message": "Welcome to Enterprise Knowledge Assistant API",
-        "status": "Running successfully"
+        "status": "running"
     }
 
 
-# Pydantic Model Implementation
-
-class Document(BaseModel):
-    title: str = Field(min_length=1)
-    category: str = Field(min_length=1)
-    description: str = Field(min_length=1)
-
-
-# Pydantic Model for partial document updates
-class DocumentPatch(BaseModel):
-    title: str | None = Field(default=None, min_length=1)
-    category: str | None = Field(default=None, min_length=1)
-    description: str | None = Field(default=None, min_length=1)
-
-
-# Temporary in-memory document storage
-documents = {}
-next_id = 1
-
-
 # ==========================================
-# GET METHOD - Fetch all documents
+# Health Check API
 # ==========================================
 
-@app.get("/documents")
-def get_all_documents():
-
+@app.get("/health", tags=["Health"])
+def health():
     return {
-        "total_documents": len(documents),
-        "documents": list(documents.values())
+        "status": "healthy"
     }
 
 
 # ==========================================
-# GET METHOD - Fetch document by ID
+# Register API Routers
 # ==========================================
 
-@app.get("/documents/{doc_id}")
-def get_document(doc_id: int):
-
-    if doc_id not in documents:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found"
-        )
-
-    return documents[doc_id]
-
-
-# ==========================================
-# POST METHOD - Create a new document
-# ==========================================
-
-@app.post("/documents", status_code=201)
-def create_document(document: Document):
-
-    global next_id
-
-    new_document = {
-        "id": next_id,
-        **document.model_dump()
-    }
-
-    documents[next_id] = new_document
-    next_id += 1
-
-    return {
-        "message": "Document created successfully",
-        "document": new_document
-    }
-
-
-# ==========================================
-# PUT METHOD - Replace complete document
-# ==========================================
-
-@app.put("/documents/{doc_id}")
-def update_document(doc_id: int, document: Document):
-
-    if doc_id not in documents:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found"
-        )
-
-    updated_document = {
-        "id": doc_id,
-        **document.model_dump()
-    }
-
-    documents[doc_id] = updated_document
-
-    return {
-        "message": "Document updated successfully",
-        "document": updated_document
-    }
-
-
-# ==========================================
-# PATCH METHOD - Partially update document
-# ==========================================
-
-@app.patch("/documents/{doc_id}")
-def patch_document(doc_id: int, document: DocumentPatch):
-
-    if doc_id not in documents:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found"
-        )
-
-    update_data = document.model_dump(exclude_unset=True)
-    if not update_data:
-        raise HTTPException(
-            status_code=400,
-            detail="No fields provided for update"
-        )
-
-    # Reject explicit null values
-    if any(value is None for value in update_data.values()):
-        raise HTTPException(
-            status_code=400,
-            detail="Null values are not allowed"
-        )
-
-    # Update only the provided fields
-    documents[doc_id].update(update_data)
-
-    return {
-        "message": "Document updated successfully",
-        "document": documents[doc_id]
-    }
-
-
-# ==========================================
-# DELETE METHOD - Delete a document
-# ==========================================
-
-@app.delete("/documents/{doc_id}")
-def delete_document(doc_id: int):
-
-    if doc_id not in documents:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found"
-        )
-
-    deleted_document = documents.pop(doc_id)
-
-    return {
-        "message": "Document deleted successfully",
-        "document": deleted_document
-    }
+app.include_router(documents.router)
+app.include_router(knowledge.router)
