@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,28 +9,21 @@ from fastapi import (
     UploadFile,
     status
 )
-
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from backend.app.core.config import settings
 from backend.app.core.database import get_db
-
 from backend.app.models.document import Document, DocumentChunk
-
 from backend.app.schemas.document import (
     DocumentCreate,
     DocumentUpdate,
-    DocumentPatch,
-    DocumentOut,
-    DocumentList
+    DocumentPatch
 )
-
 from backend.app.services.document_service import (
     extract_text,
     split_into_chunks
 )
-
 from backend.app.services.ai_service import create_embedding
 
 
@@ -41,11 +33,11 @@ router = APIRouter(
 )
 
 
-# ==========================================
-# GET - Fetch all documents
-# ==========================================
+# =====================================================
+# 1. GET ALL DOCUMENTS
+# =====================================================
 
-@router.get("/", response_model=DocumentList)
+@router.get("/")
 def get_documents(db: Session = Depends(get_db)):
 
     total = db.scalar(
@@ -62,11 +54,197 @@ def get_documents(db: Session = Depends(get_db)):
     }
 
 
-# ==========================================
-# GET - Fetch document by ID
-# ==========================================
+# =====================================================
+# 2. UPLOAD AND PROCESS DOCUMENT
+# =====================================================
 
-@router.get("/{doc_id}", response_model=DocumentOut)
+@router.post("/upload", status_code=status.HTTP_201_CREATED)
+async def upload_document(
+    file: UploadFile = File(...),
+    title: str | None = None,
+    category: str = "General",
+    description: str = "",
+    db: Session = Depends(get_db)
+):
+
+    allowed_extensions = {".pdf", ".docx", ".txt"}
+
+    original_filename = file.filename or "Untitled"
+
+    suffix = Path(original_filename).suffix.lower()
+
+    # Validate file extension
+    if suffix not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Supported formats: PDF, DOCX, TXT"
+        )
+
+    # Read uploaded file
+    content = await file.read()
+    await file.close()
+
+    if not content:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty"
+        )
+
+    # Validate file size
+    max_bytes = settings.max_file_size_mb * 1024 * 1024
+
+    if len(content) > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File exceeds {settings.max_file_size_mb} MB limit"
+        )
+
+    # Create upload directory
+    upload_dir = Path(settings.upload_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate a unique filename
+    safe_name = f"{uuid4().hex}{suffix}"
+
+    saved_path = upload_dir / safe_name
+
+    # Save file
+    saved_path.write_bytes(content)
+
+    # -------------------------------------------------
+    # Extract text and create chunks
+    # -------------------------------------------------
+
+    try:
+
+        extracted_text = extract_text(str(saved_path))
+
+        if not extracted_text or not extracted_text.strip():
+            raise ValueError(
+                "No readable text found in the uploaded document"
+            )
+
+        chunks = split_into_chunks(
+    extracted_text,
+    chunk_size=settings.chunk_size,
+    overlap=settings.chunk_overlap
+)
+
+        if not chunks:
+            raise ValueError(
+                "No text chunks could be generated"
+            )
+
+    except Exception as exc:
+
+        saved_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Document processing failed: {str(exc)}"
+        )
+
+    # -------------------------------------------------
+    # Save document and generate embeddings
+    # -------------------------------------------------
+
+    embedding_success_count = 0
+    embedding_failure_count = 0
+
+    try:
+
+        doc = Document(
+            title=(
+                title.strip()
+                if title and title.strip()
+                else Path(original_filename).stem
+            ),
+            category=category,
+            description=description or "Uploaded document",
+            file_name=original_filename,
+            file_path=str(saved_path)
+        )
+
+        db.add(doc)
+        db.flush()
+
+        # Generate embedding for every chunk
+        for index, chunk_text in enumerate(chunks):
+
+            vector = None
+
+            try:
+
+                vector = await create_embedding(chunk_text)
+
+                embedding_success_count += 1
+
+            except Exception as exc:
+
+                embedding_failure_count += 1
+
+                print(
+                    f"Embedding failed for chunk {index}: {exc}"
+                )
+
+            db.add(
+                DocumentChunk(
+                    document_id=doc.id,
+                    chunk_index=index,
+                    chunk_text=chunk_text,
+                    embedding=vector
+                )
+            )
+
+        # Commit document and chunks
+        db.commit()
+
+        db.refresh(doc)
+
+    except Exception as exc:
+
+        db.rollback()
+
+        saved_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database processing failed: {str(exc)}"
+        )
+
+    # -------------------------------------------------
+    # Determine embedding status
+    # -------------------------------------------------
+
+    if embedding_success_count == len(chunks):
+
+        embedding_status = "completed"
+
+    elif embedding_success_count > 0:
+
+        embedding_status = "partial"
+
+    else:
+
+        embedding_status = "unavailable"
+
+    return {
+        "message": "Document uploaded and processed successfully",
+        "document_id": doc.id,
+        "title": doc.title,
+        "file_name": doc.file_name,
+        "chunks_created": len(chunks),
+        "embedding_status": embedding_status,
+        "embedded_chunks": embedding_success_count,
+        "failed_embeddings": embedding_failure_count
+    }
+
+
+# =====================================================
+# 3. GET DOCUMENT BY ID
+# =====================================================
+
+@router.get("/{doc_id}")
 def get_document(
     doc_id: int,
     db: Session = Depends(get_db)
@@ -83,168 +261,32 @@ def get_document(
     return doc
 
 
-# ==========================================
-# POST - Upload and process document
-# ==========================================
+# =====================================================
+# 4. CREATE DOCUMENT
+# =====================================================
 
-@router.post(
-    "/upload",
-    status_code=status.HTTP_201_CREATED
-)
-async def upload_document(
-    file: UploadFile = File(...),
-    title: str | None = None,
-    category: str = "General",
-    description: str = "",
-    db: Session = Depends(get_db)
-):
-
-    # 1. Validate file format
-
-    allowed = {".pdf", ".docx", ".txt"}
-
-    suffix = Path(file.filename or "").suffix.lower()
-
-    if suffix not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail="Supported formats: PDF, DOCX, TXT"
-        )
-
-    # 2. Read and validate file size
-
-    content = await file.read()
-
-    max_bytes = settings.max_file_size_mb * 1024 * 1024
-
-    if not content:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty"
-        )
-
-    if len(content) > max_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File exceeds {settings.max_file_size_mb} MB limit"
-        )
-
-    # 3. Save uploaded file
-
-    upload_dir = Path(settings.upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_name = f"{uuid4().hex}{suffix}"
-    saved_path = upload_dir / safe_name
-
-    try:
-
-        saved_path.write_bytes(content)
-
-        # 4. Extract text
-
-        extracted = extract_text(str(saved_path))
-
-        if not extracted or not extracted.strip():
-            raise ValueError(
-                "No readable text found in the uploaded document"
-            )
-
-        # 5. Split text into chunks
-
-        chunks = split_into_chunks(extracted)
-
-        if not chunks:
-            raise ValueError(
-                "Document could not be divided into chunks"
-            )
-
-    except Exception as exc:
-
-        saved_path.unlink(missing_ok=True)
-
-        raise HTTPException(
-            status_code=400,
-            detail=f"Document processing failed: {str(exc)}"
-        )
-
-    # 6. Create document record
-
-    doc = Document(
-        title=title or Path(file.filename or "Untitled").stem,
-        category=category,
-        description=description or "Uploaded document",
-        file_name=file.filename,
-        file_path=str(saved_path)
-    )
-
-    try:
-
-        db.add(doc)
-        db.flush()
-
-        # 7. Generate embeddings and save chunks
-
-        for index, chunk_text in enumerate(chunks):
-
-            vector = await create_embedding(chunk_text)
-
-            db.add(
-                DocumentChunk(
-                    document_id=doc.id,
-                    chunk_index=index,
-                    chunk_text=chunk_text,
-                    embedding=vector
-                )
-            )
-
-        # 8. Commit database records
-
-        db.commit()
-        db.refresh(doc)
-
-    except Exception as exc:
-
-        db.rollback()
-        saved_path.unlink(missing_ok=True)
-
-        raise HTTPException(
-            status_code=502,
-            detail=f"Document processing failed: {str(exc)}"
-        )
-
-    # 9. Return response
-
-    return {
-        "message": "Document uploaded and processed successfully",
-        "document_id": doc.id,
-        "title": doc.title,
-        "file_name": doc.file_name,
-        "chunks_created": len(chunks),
-        "embedding_status": "created"
-    }
-
-
-# ==========================================
-# POST - Create document manually
-# ==========================================
-
-@router.post(
-    "/",
-    status_code=status.HTTP_201_CREATED
-)
+@router.post("/", status_code=status.HTTP_201_CREATED)
 def create_document(
     payload: DocumentCreate,
     db: Session = Depends(get_db)
 ):
 
-    doc = Document(
-        **payload.model_dump()
-    )
+    doc = Document(**payload.model_dump())
 
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
+    try:
+
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+
+    except Exception:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create document"
+        )
 
     return {
         "message": "Document created successfully",
@@ -252,9 +294,9 @@ def create_document(
     }
 
 
-# ==========================================
-# PUT - Replace complete document
-# ==========================================
+# =====================================================
+# 5. REPLACE DOCUMENT - PUT
+# =====================================================
 
 @router.put("/{doc_id}")
 def replace_document(
@@ -274,8 +316,19 @@ def replace_document(
     for key, value in payload.model_dump().items():
         setattr(doc, key, value)
 
-    db.commit()
-    db.refresh(doc)
+    try:
+
+        db.commit()
+        db.refresh(doc)
+
+    except Exception:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to replace document"
+        )
 
     return {
         "message": "Document replaced successfully",
@@ -283,9 +336,9 @@ def replace_document(
     }
 
 
-# ==========================================
-# PATCH - Partially update document
-# ==========================================
+# =====================================================
+# 6. PARTIALLY UPDATE DOCUMENT - PATCH
+# =====================================================
 
 @router.patch("/{doc_id}")
 def patch_document(
@@ -319,8 +372,19 @@ def patch_document(
     for key, value in changes.items():
         setattr(doc, key, value)
 
-    db.commit()
-    db.refresh(doc)
+    try:
+
+        db.commit()
+        db.refresh(doc)
+
+    except Exception:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update document"
+        )
 
     return {
         "message": "Document partially updated successfully",
@@ -328,9 +392,9 @@ def patch_document(
     }
 
 
-# ==========================================
-# DELETE - Delete document
-# ==========================================
+# =====================================================
+# 7. DELETE DOCUMENT
+# =====================================================
 
 @router.delete("/{doc_id}")
 def delete_document(
@@ -346,20 +410,14 @@ def delete_document(
             detail="Document not found"
         )
 
-    deleted_document = {
+    deleted = {
         "id": doc.id,
         "title": doc.title
     }
 
+    file_path = doc.file_path
+
     try:
-
-        # Delete associated chunks first
-
-        db.execute(
-            delete(DocumentChunk).where(
-                DocumentChunk.document_id == doc_id
-            )
-        )
 
         db.delete(doc)
         db.commit()
@@ -367,12 +425,24 @@ def delete_document(
     except Exception:
 
         db.rollback()
+
         raise HTTPException(
             status_code=500,
-            detail="Unable to delete document"
+            detail="Failed to delete document"
         )
+
+    # Delete physical file after successful DB deletion
+    if file_path:
+
+        try:
+
+            Path(file_path).unlink(missing_ok=True)
+
+        except OSError as exc:
+
+            print(f"File cleanup warning: {exc}")
 
     return {
         "message": "Document deleted successfully",
-        "document": deleted_document
+        "document": deleted
     }
