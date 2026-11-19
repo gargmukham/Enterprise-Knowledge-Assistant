@@ -1,288 +1,419 @@
 
-import re
-import math
 
 from fastapi import APIRouter, Depends, HTTPException
+
 from pydantic import BaseModel, Field
+ 
 from sqlalchemy import select
+
 from sqlalchemy.orm import Session
-
+ 
 from backend.app.core.database import get_db
-from backend.app.models.document import Document, DocumentChunk
+ 
+from backend.app.models.document import (
+
+    Document,
+
+    DocumentChunk
+
+)
+ 
 from backend.app.services.ai_service import (
+
     create_embedding,
+
     generate_answer
+
 )
-
-
+ 
+from backend.app.services.vector_service import search_chunks
+ 
+ 
 router = APIRouter(
+
     prefix="/knowledge",
+
     tags=["Knowledge Search & Q&A"]
+
 )
-
-
-# ==========================================
-# REQUEST SCHEMAS
+ 
+ 
 # ==========================================
 
+# 1. REQUEST SCHEMAS
+
+# ==========================================
+ 
 class SearchRequest(BaseModel):
-    query: str = Field(min_length=2, max_length=2000)
-    top_k: int = Field(default=5, ge=1, le=20)
+ 
+    query: str = Field(
 
+        min_length=2,
 
+        max_length=2000
+
+    )
+ 
+    top_k: int = Field(
+
+        default=5,
+
+        ge=1,
+
+        le=20
+
+    )
+ 
+ 
 class AskRequest(BaseModel):
-    question: str = Field(min_length=2, max_length=2000)
-    top_k: int = Field(default=5, ge=1, le=10)
+ 
+    question: str = Field(
 
+        min_length=2,
 
-# ==========================================
-# COSINE SIMILARITY
-# ==========================================
+        max_length=2000
 
-def cosine_similarity(
-    a: list[float],
-    b: list[float]
-) -> float:
-
-    if not a or not b or len(a) != len(b):
-        return 0.0
-
-    dot_product = sum(x * y for x, y in zip(a, b))
-
-    magnitude_a = math.sqrt(sum(x * x for x in a))
-    magnitude_b = math.sqrt(sum(y * y for y in b))
-
-    if magnitude_a == 0 or magnitude_b == 0:
-        return 0.0
-
-    return dot_product / (magnitude_a * magnitude_b)
-
-
-# ==========================================
-# KEYWORD SEARCH FALLBACK
-# ==========================================
-
-def keyword_search(
-    query: str,
-    rows: list,
-    top_k: int
-):
-
-    query_terms = set(
-        re.findall(r"\b\w+\b", query.lower())
     )
+ 
+    top_k: int = Field(
 
-    stop_words = {
-        "the", "is", "are", "was", "were",
-        "a", "an", "and", "or", "in", "on",
-        "at", "to", "of", "for", "with",
-        "what", "which", "who", "how", "does"
-    }
+        default=5,
 
-    query_terms -= stop_words
+        ge=1,
 
-    if not query_terms:
-        query_terms = set(
-            re.findall(r"\b\w+\b", query.lower())
-        )
+        le=10
 
-    scored = []
-
-    for row in rows:
-
-        text_terms = set(
-            re.findall(r"\b\w+\b", row.chunk_text.lower())
-        )
-
-        matching_terms = query_terms.intersection(text_terms)
-
-        if matching_terms:
-
-            score = len(matching_terms) / len(query_terms)
-
-            scored.append((float(score), row))
-
-    scored.sort(
-        key=lambda item: item[0],
-        reverse=True
     )
-
-    return scored[:top_k]
-
-
-# ==========================================
-# RETRIEVE RELEVANT DOCUMENT CHUNKS
+ 
+ 
 # ==========================================
 
+# 2. RETRIEVE RELEVANT CHUNKS
+
+# ==========================================
+ 
 async def retrieve_chunks(
+
     query: str,
+
     top_k: int,
+
     db: Session
+
 ):
-
-    rows = db.scalars(
-        select(DocumentChunk)
-    ).all()
-
-    if not rows:
-        return []
-
-    # Try semantic search first
-
-    query_vector = None
-
+ 
     try:
-        query_vector = await create_embedding(query)
+ 
+        # Generate embedding for user query
+ 
+        query_embedding = await create_embedding(query)
+ 
+        # Search vectors in ChromaDB
+ 
+        matches = search_chunks(
 
-    except Exception:
-        query_vector = None
+            query_embedding,
 
-    if query_vector:
+            top_k
 
-        scored = []
-
-        for row in rows:
-
-            if row.embedding:
-
-                score = cosine_similarity(
-                    query_vector,
-                    row.embedding
-                )
-
-                scored.append((score, row))
-
-        scored.sort(
-            key=lambda item: item[0],
-            reverse=True
         )
+ 
+        if not matches:
 
-        if scored:
-            return scored[:top_k]
+            return []
+ 
+        # Extract vector IDs
+ 
+        vector_ids = [
 
-    # Fallback to keyword search
+            match["vector_id"]
 
-    return keyword_search(
-        query,
-        rows,
-        top_k
-    )
+            for match in matches
 
+        ]
+ 
+        # Retrieve matching chunk metadata from SQL Server
+ 
+        rows = db.scalars(
 
-# ==========================================
-# KNOWLEDGE SEARCH API
-# ==========================================
+            select(DocumentChunk).where(
 
-@router.post("/search")
-async def search_knowledge(
-    payload: SearchRequest,
-    db: Session = Depends(get_db)
-):
+                DocumentChunk.vector_id.in_(vector_ids)
 
-    matches = await retrieve_chunks(
-        payload.query,
-        payload.top_k,
-        db
-    )
+            )
 
-    results = []
+        ).all()
+ 
+        rows_by_vector_id = {
 
-    for score, row in matches:
+            row.vector_id: row
 
-        document = db.get(Document, row.document_id)
+            for row in rows
 
-        results.append({
-            "document_id": row.document_id,
-            "document_title": document.title if document else None,
-            "chunk_id": row.id,
-            "chunk_index": row.chunk_index,
-            "chunk_text": row.chunk_text,
-            "score": round(score, 4)
-        })
-
-    return {
-        "query": payload.query,
-        "total_results": len(results),
-        "results": results
-    }
-
-
-# ==========================================
-# ASK QUESTION API
-# ==========================================
-
-@router.post("/ask")
-async def ask_question(
-    payload: AskRequest,
-    db: Session = Depends(get_db)
-):
-
-    matches = await retrieve_chunks(
-        payload.question,
-        payload.top_k,
-        db
-    )
-
-    # No relevant content found
-
-    if not matches:
-
-        return {
-            "question": payload.question,
-            "answer": (
-                "I could not find relevant information "
-                "in the uploaded documents."
-            ),
-            "total_sources": 0,
-            "sources": []
         }
+ 
+        # Preserve ChromaDB ranking order
+ 
+        results = []
+ 
+        for match in matches:
+ 
+            row = rows_by_vector_id.get(
 
-    # Prepare document context
+                match["vector_id"]
 
-    context = "\n\n".join(
-        (
-            f"[Document ID: {row.document_id}, "
-            f"Chunk ID: {row.id}]\n"
-            f"{row.chunk_text}"
-        )
-        for score, row in matches
-    )
+            )
+ 
+            if row is not None:
+ 
+                results.append({
 
-    # Generate AI answer
+                    "chunk": row,
 
-    try:
+                    "similarity": match["similarity"],
 
-        answer = await generate_answer(
-            payload.question,
-            context
-        )
+                    "distance": match["distance"]
 
+                })
+ 
+        return results
+ 
     except Exception as exc:
-
+ 
         raise HTTPException(
+
             status_code=503,
-            detail=f"AI service is unavailable: {str(exc)}"
+
+            detail=f"Semantic search failed: {str(exc)}"
+
         )
+ 
+ 
+# ==========================================
 
-    # Prepare source information
+# 3. SEMANTIC SEARCH API
 
-    sources = []
+# ==========================================
+ 
+@router.post("/search")
 
-    for score, row in matches:
+async def search_knowledge(
 
-        document = db.get(Document, row.document_id)
+    payload: SearchRequest,
 
-        sources.append({
+    db: Session = Depends(get_db)
+
+):
+ 
+    matches = await retrieve_chunks(
+
+        payload.query,
+
+        payload.top_k,
+
+        db
+
+    )
+ 
+    results = []
+ 
+    for match in matches:
+ 
+        row = match["chunk"]
+ 
+        document = db.get(
+
+            Document,
+
+            row.document_id
+
+        )
+ 
+        results.append({
+
             "document_id": row.document_id,
-            "document_title": document.title if document else None,
-            "chunk_id": row.id,
-            "chunk_index": row.chunk_index,
-            "score": round(score, 4)
-        })
 
+            "document_title": (
+
+                document.title if document else None
+
+            ),
+
+            "chunk_id": row.id,
+
+            "chunk_index": row.chunk_index,
+
+            "chunk_text": row.chunk_text,
+
+            "similarity": round(
+
+                match["similarity"],
+
+                4
+
+            )
+
+        })
+ 
     return {
-        "question": payload.question,
-        "answer": answer,
-        "total_sources": len(sources),
-        "sources": sources
+
+        "query": payload.query,
+
+        "total_results": len(results),
+
+        "results": results
+
     }
+ 
+ 
+# ==========================================
+
+# 4. ASK QUESTION API
+
+# ==========================================
+ 
+@router.post("/ask")
+
+async def ask_question(
+
+    payload: AskRequest,
+
+    db: Session = Depends(get_db)
+
+):
+ 
+    # Step 1: Retrieve relevant chunks
+ 
+    matches = await retrieve_chunks(
+
+        payload.question,
+
+        payload.top_k,
+
+        db
+
+    )
+ 
+    if not matches:
+ 
+        return {
+
+            "question": payload.question,
+
+            "answer": (
+
+                "I could not find relevant information "
+
+                "in the uploaded documents."
+
+            ),
+
+            "total_sources": 0,
+
+            "sources": []
+
+        }
+ 
+    # Step 2: Prepare context for LLM
+ 
+    context_parts = []
+ 
+    for match in matches:
+ 
+        row = match["chunk"]
+ 
+        document = db.get(
+
+            Document,
+
+            row.document_id
+
+        )
+ 
+        context_parts.append(
+
+            f"Document: {document.title if document else 'Unknown'}\n"
+
+            f"Chunk: {row.chunk_index}\n"
+
+            f"Content: {row.chunk_text}"
+
+        )
+ 
+    context = "\n\n".join(context_parts)
+ 
+    # Step 3: Generate AI answer
+ 
+    try:
+ 
+        answer = await generate_answer(
+
+            question=payload.question,
+
+            context=context
+
+        )
+ 
+    except Exception as exc:
+ 
+        raise HTTPException(
+
+            status_code=503,
+
+            detail=f"AI answer generation failed: {str(exc)}"
+
+        )
+ 
+    # Step 4: Prepare source information
+ 
+    sources = []
+ 
+    for match in matches:
+ 
+        row = match["chunk"]
+ 
+        document = db.get(
+
+            Document,
+
+            row.document_id
+
+        )
+ 
+        sources.append({
+
+            "document_id": row.document_id,
+
+            "document_title": (
+
+                document.title if document else None
+
+            ),
+
+            "chunk_id": row.id,
+
+            "chunk_index": row.chunk_index,
+
+            "similarity": round(
+
+                match["similarity"],
+
+                4
+
+            )
+
+        })
+ 
+    return {
+
+        "question": payload.question,
+
+        "answer": answer,
+
+        "total_sources": len(sources),
+
+        "sources": sources
+
+    }
+
+ 

@@ -4,7 +4,7 @@ from pathlib import Path
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 
-
+#extract document text 
 def extract_text(file_path: str | Path) -> str:
     """
     Extract text from PDF, DOCX, or TXT files.
@@ -41,11 +41,12 @@ def extract_text(file_path: str | Path) -> str:
 
     return text
 
+#split into chunks
 
 def split_into_chunks(
     text: str,
-    chunk_size: int = 1000,
-    overlap: int = 150
+    chunk_size: int = 800,
+    overlap: int = 120
 ) -> list[str]:
     """
     Split extracted text into overlapping chunks.
@@ -57,19 +58,35 @@ def split_into_chunks(
     if overlap < 0 or overlap >= chunk_size:
         raise ValueError("overlap must be smaller than chunk_size")
 
-    words = text.split()
     chunks = []
 
     start = 0
 
-    while start < len(words):
-        end = start + chunk_size
+    while start < len(text):
+        end = min(
+            start + chunk_size,
+            len(text)
+        )
+        #prefer ending at a word boundary
+        if end < len(text):
+            boundary= text.rfind(
+                " ",
+                start,
+                end
+            )
+            if boundary > start + chunk_size // 2:
+                end = boundary
+        chunk = text[start:end].strip()
 
-        chunk = " ".join(words[start:end])
-
-        if chunk.strip():
+        if chunk:
             chunks.append(chunk)
 
-        start += chunk_size - overlap
+        if end >= len(text):
+            break
+
+        start = max(
+            start + 1,
+            end - overlap
+        )
 
     return chunks
